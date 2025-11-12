@@ -1,0 +1,194 @@
+TRUNCATE TABLE {{ temp_dataset.dataset }}.{{ temp_dataset.matching_table }};
+TRUNCATE TABLE {{ temp_dataset.dataset }}.{{ temp_dataset.mapping_table }};
+TRUNCATE TABLE {{ output.dataset }}.{{ output.table }};
+
+{# Helper: build matched condition: all min_distance_<field> <= threshold (coalesce NULL to 0) #}
+{%- set matched_conds = [] -%}
+INSERT INTO {{ temp_dataset.dataset }}.{{ temp_dataset.matching_table }} (
+  {%- for ef in matching_rules.exact.keys() %}
+    {{ ef }}{%- if not loop.last %}, {% endif %}
+  {%- endfor %}
+  {%- if matching_rules.fuzzy %},{% endif %}
+  {%- for ff in matching_rules.fuzzy.keys() %}
+    {{ ff }}_arr{%- if not loop.last %}, {% endif %}
+  {%- endfor %}
+  , source_id_arr, source_pk_arr
+  {%- if matching_rules.fuzzy %},{% endif %}
+  {%- for ff in matching_rules.fuzzy.keys() %}
+    min_distance_{{ ff }}{%- if not loop.last %}, {% endif %}
+  {%- endfor %}
+)
+WITH
+-- 1) Union all sources into a canonical set of columns (one row per source record)
+all_sources AS (
+{%- for src in sources %}
+  {%- set src_table = src.dataset ~ '.' ~ src.table %}
+  SELECT
+    '{{ src.name }}' AS source_name,
+    {{ src_table }}.{{ src.source_id }} AS source_id,
+    {{ src_table }}.{{ src.source_pk }} AS source_pk
+    {# emit each unified field (exact + fuzzy) mapped from the source, or NULL if missing #}
+    {%- set all_fields = (matching_rules.exact.keys() | list) + (matching_rules.fuzzy.keys() | list) %}
+    {%- for field in all_fields %}
+      , {%- set col = src.fields.get(field) -%}
+      {%- if col -%}
+        {{ src_table }}.{{ col }} AS {{ field }}
+      {%- else -%}
+        NULL AS {{ field }}
+      {%- endif -%}
+    {%- endfor %}
+  FROM {{ src_table }}
+  {%- if src.filter_expression %}
+  WHERE {{ src.filter_expression }}
+  {%- endif %}
+  {%- if not loop.last %}
+  UNION ALL
+  {%- endif %}
+{%- endfor %}
+),
+
+-- 2) Aggregate rows into groups defined by exact matching fields and build arrays for fuzzy fields and source identifiers
+mapped AS (
+  SELECT
+    {%- for ef in matching_rules.exact.keys() %}
+      {{ ef }}{%- if not loop.last %}, {% endif %}
+    {%- endfor %}
+
+    {%- if matching_rules.fuzzy %}
+      {%- if matching_rules.exact %}, {% endif %}
+      {%- for ff in matching_rules.fuzzy.keys() %}
+        groupArray({{ ff }}) AS {{ ff }}_arr{%- if not loop.last %}, {% endif %}
+      {%- endfor %}
+    {%- endif %}
+
+    {%- if matching_rules.fuzzy %}, {% endif %}
+    groupArray(source_id) AS source_id_arr,
+    groupArray(source_pk) AS source_pk_arr
+  FROM all_sources
+  GROUP BY
+    {%- for ef in matching_rules.exact.keys() %}
+      {{ ef }}{%- if not loop.last %}, {% endif %}
+    {%- endfor %}
+){% if (matching_rules.fuzzy | length) > 0 %},{% endif %}
+
+{# 3) Chain: for each fuzzy field compute min_distance using the previous step as input,
+     then create a new step CTE that preserves all columns and adds the min_distance column.
+#}
+{%- for ff, meta in matching_rules.fuzzy.items() %}
+{# compute min distance for {{ ff }} using previous step as input #}
+min_distance_{{ ff }} AS (
+  SELECT
+    {%- for ef in matching_rules.exact.keys() %}
+      {{ ef }}{%- if not loop.last %}, {% endif %}
+    {%- endfor %},
+    min(levenshteinDistance(a, b)) AS min_distance_{{ ff }}
+  FROM {{ 'mapped' if loop.index0 == 0 else 'step_' ~ loop.index0 }}
+  ARRAY JOIN {{ ff }}_arr AS a
+  ARRAY JOIN {{ ff }}_arr AS b
+  WHERE a < b
+  GROUP BY
+    {%- for ef in matching_rules.exact.keys() %}
+      {{ ef }}{%- if not loop.last %}, {% endif %}
+    {%- endfor %}
+),
+
+step_{{ loop.index }} AS (
+  SELECT p.*, md.min_distance_{{ ff }}
+  FROM {{ 'mapped' if loop.index0 == 0 else 'step_' ~ loop.index0 }} AS p
+  LEFT JOIN min_distance_{{ ff }} AS md USING (
+    {%- for ef in matching_rules.exact.keys() -%}
+      {{ ef }}{%- if not loop.last %}, {% endif %}
+    {%- endfor -%}
+  )
+){% if not loop.last %},{% endif %}
+{%- endfor %}
+
+-- 4) Final: select from the last step (or mapped if no fuzzy fields) to insert into tmp_unified
+{%- set final_cte = 'mapped' if (matching_rules.fuzzy | length) == 0 else 'step_' ~ (matching_rules.fuzzy | length) %}
+SELECT *
+FROM {{ final_cte }} AS unified;
+
+
+/*
+  Check if the group is match or not
+*/
+ALTER TABLE {{ temp_dataset.dataset }}.{{ temp_dataset.matching_table }}
+UPDATE
+  is_matched = 1
+  , unified_ids = [generateUUIDv4()]
+WHERE
+  {%- for key, val in matching_rules.fuzzy.items() %}
+    min_distance_{{ key }} <= {{ val.threshold }} {% if not loop.last %} AND {% endif %}
+  {%- endfor %}
+;
+
+ALTER TABLE {{ temp_dataset.dataset }}.{{ temp_dataset.matching_table }}
+UPDATE
+  is_matched = 0
+  , unified_ids = arrayMap(x -> generateUUIDv4(), range(length(source_id_arr)))
+WHERE
+  {%- for key, val in matching_rules.fuzzy.items() %}
+    min_distance_{{ key }} > {{ val.threshold }} {% if not loop.last %} OR {% endif %}
+  {%- endfor %}
+;
+
+/*
+  For each group, generate UUID and insert into unified table
+*/
+
+INSERT INTO {{ temp_dataset.dataset }}.{{ temp_dataset.mapping_table }}
+(
+  group_id,
+  source_id,
+  source_pk
+)
+WITH source AS (
+  SELECT
+    CASE 
+      WHEN is_matched = 1 THEN unified_ids[1]
+      ELSE unified_ids[index]
+    END AS group_id,
+    source_id_arr[index] AS source_id,
+    source_pk_arr[index] AS source_pk
+  FROM {{ temp_dataset.dataset }}.{{ temp_dataset.matching_table }}
+  ARRAY JOIN arrayEnumerate(source_id_arr) AS index
+)
+SELECT * FROM source;
+
+/*
+  Insert into Unified table
+*/
+INSERT INTO {{ output.dataset }}.{{ output.table }}
+(
+  user_profile_id,
+  --exact rule
+  {%- for ef in matching_rules.exact.keys() %}
+      {{ ef }}{% if not loop.last %}, {% endif %}
+    {%- endfor %}
+  {%- if unify_rules.items()|length > 0 %}, {% endif %}
+
+  --fuzzy field
+  {%- for field, rule in unify_rules.items() %}
+      {{ field }}{% if not loop.last %}, {% endif %}
+    {%- endfor %}
+)
+WITH source AS (
+  SELECT
+    arrayJoin(unified_ids) AS user_profile_id,
+    {%- for ef in matching_rules.exact.keys() %}
+      {{ ef }}{% if not loop.last %}, {% endif %}
+    {%- endfor %}
+    {%- if unify_rules.items()|length > 0 %}, {% endif %}
+    {%- for field, rule in unify_rules.items() %}
+      {% if rule.method == 'most_frequent' %}
+        arrayMax({{ field }}_arr) AS {{ field }}
+      {% elif rule.method == 'les_frequent' %}
+        arrayMin({{ field }}_arr) AS {{ field }}
+      {% elif rule.method == 'source_preference' %}
+        {{ field }}_arr[indexOf(source_id_arr, '{{ rule.source }}')] AS {{ field }}
+      {% endif %}
+      {% if not loop.last %}, {% endif %}
+    {%- endfor %}
+  FROM {{ temp_dataset.dataset }}.{{ temp_dataset.matching_table }}
+)
+SELECT * FROM source;

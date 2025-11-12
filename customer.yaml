@@ -1,0 +1,54 @@
+sources:
+  - name: customers_a
+    table: customers_a
+    dataset: crm
+    source_id: source_pk
+    source_pk: pk
+    fields:
+      email: eml
+      first_name: fst_name
+      last_name: lst_name
+      birthdate: birthdate
+      phone: home_phone
+    filter_expression:
+  
+  - name: customers_b
+    table: customers_b
+    dataset: sap
+    source_id: source_pk
+    source_pk: pk
+    fields:
+      email: email
+      first_name: first_name
+      last_name: last_name
+      birthdate: birthdate
+      phone: other_phone
+    filter_expression:
+
+matching_rules:
+  exact:
+    email:
+    phone:
+    birthdate:
+
+  fuzzy: 
+    last_name:
+      threshold: 2
+    first_name:
+      threshold: 2
+
+unify_rules:
+  last_name:
+    method: les_frequent
+  first_name:
+    method: source_preference
+    source: src_a
+
+temp_dataset:
+  dataset: unify
+  matching_table: matched
+  mapping_table: mapping_source
+
+output:
+  dataset: edw
+  table: customer
